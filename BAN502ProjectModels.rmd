@@ -1,0 +1,347 @@
+---
+title: "BAN502ProjectPart2"
+author: "Nicholas Smith"
+date: "2025-03-02"
+output: word_document
+---
+
+The following is a series of different models trained to predict the failure of a product ("Super Soaker") for Keep It Dry company based on a number of materials and measurements from a training data set.   
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(caret)
+library(mice)
+library(VIM)
+library(randomForest)
+library(ranger)
+library(RColorBrewer)
+library(rpart)
+library(rattle)
+library(e1071)
+library(xgboost)
+library(usemodels)
+library(nnet)
+```
+
+```{r}
+faildata = read_csv("train.csv")
+```
+```{r}
+faildata = faildata %>%
+  mutate(product_code = as_factor(product_code)) %>%
+  mutate(attribute_0 = as_factor(attribute_0)) %>%
+  mutate(attribute_1 = as_factor(attribute_1)) %>%
+  mutate(failure = as_factor(failure))
+```
+
+## Missingness  
+
+```{r}
+vim_plot = aggr(faildata, numbers = TRUE, prop = c(TRUE, FALSE),cex.lab = 2, cex.axis=.4)
+```
+
+The data set had a number of missing entries which need to be dealt with. As loading may not be a random variable, and instead potentially set during testing, imputing the variable might lead to undue error. Because of this, any entries with missing values for loading will be removed. The values for measurements will be imputed with a random seed and m=10.  The IDs will also be removed as the models will not need to process those.
+
+```{r}
+faildata = faildata %>% 
+  select(-id) %>%
+  drop_na(loading)
+set.seed(4321)
+imp_fail = mice(faildata, m=10, method='pmm', printFlag=FALSE)
+```
+
+```{r}
+fail_complete = complete(imp_fail)
+```
+
+The data is now free of missing data, and can now be used in the models proper.  
+```{r}
+vim_plot = aggr(fail_complete, numbers = TRUE, prop = c(TRUE, FALSE),cex.lab = 2, cex.axis=.4)
+```
+
+## Training Set  
+
+In order to build the models, we will split the fail_complete data into a training set and a test set. The same sets will be used across all models. Cross-validation folds will be used for building the models as well. 
+
+```{r}
+set.seed(765) 
+fail_split = initial_split(fail_complete, prop = 0.7, strata = failure)
+train = training(fail_split)
+test = testing(fail_split)
+```
+
+```{r}
+set.seed(654)
+folds = vfold_cv(train, v=5)
+```
+
+
+## Classification Trees  
+
+```{r}
+fail_tree_recipe = recipe(failure ~., train) %>%
+  step_dummy(all_nominal(),-all_outcomes())
+
+tree_model = decision_tree(cost_complexity = tune()) %>%
+  set_engine("rpart",model = TRUE) %>%
+  set_mode("classification")
+
+tree_grid = grid_regular(cost_complexity(),levels = 25)
+
+fail_tree_workflow = 
+  workflow() %>%
+  add_model(tree_model) %>%
+  add_recipe(fail_tree_recipe)
+
+tree_res = fail_tree_workflow %>%
+  tune_grid(resamples = folds, grid = tree_grid)
+```
+
+```{r}
+best_tree = tree_res %>%
+  select_best(metric = "accuracy")
+```
+
+```{r}
+final_workflow = fail_tree_workflow %>%
+  finalize_workflow(best_tree)
+```
+
+```{r}
+final_fit = fit(final_workflow, train)
+```
+
+```{r}
+treepred = predict(final_fit,train,type = "class")
+head(treepred)
+```
+
+```{r}
+confusionMatrix(treepred$.pred_class,train$failure,positive="Yes")
+```
+
+```{r}
+treepred_test = predict(final_fit,test,type = "class")
+head(treepred_test)
+```
+
+```{r}
+confusionMatrix(treepred_test$.pred_class,test$failure,positive="Yes")
+```
+
+
+## Random Forests  
+
+```{r}
+fail_rf_recipe = recipe(failure ~., train) %>%
+  step_dummy(all_nominal(), -all_outcomes())
+
+rf_model = rand_forest(mtry = tune(), min_n = tune(), trees = 100) %>%
+  set_engine("ranger",importance = "permutation") %>%
+  set_mode("classification")
+
+fail_rf_workflow = workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(fail_rf_recipe)
+
+set.seed(321)
+rf_res = tune_grid(fail_rf_workflow, resamples = folds, grid = 20)
+```
+
+```{r}
+rf_res %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Accuracy")
+```
+
+```{r}
+fail_rf_recipe = recipe(failure ~., train) %>%
+  step_dummy(all_nominal(), -all_outcomes())
+
+rf_model = rand_forest(mtry = tune(), min_n = tune(), trees = 100) %>%
+  set_engine("ranger",importance = "permutation") %>%
+  set_mode("classification")
+
+fail_rf_workflow = workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(fail_rf_recipe)
+
+rf_grid = grid_regular(
+  mtry(range = c(1,4)),
+  min_n(range = c(10,35)))
+
+set.seed(321)
+rf_res_tuned = tune_grid(fail_rf_workflow, resamples = folds, grid = rf_grid)
+```
+
+```{r}
+rf_res_tuned %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Accuracy")
+```
+
+```{r}
+best_rf = select_best(rf_res_tuned, metric = "accuracy")
+
+final_rf = finalize_workflow(fail_rf_workflow,best_rf)
+```
+
+```{r}
+final_rf_fit = fit(final_rf, train)
+```
+
+```{r}
+trainpredrf = predict(final_rf_fit, train)
+head(trainpredrf)
+confusionMatrix(trainpredrf$.pred_class, train$failure, positive = "Yes")
+```
+
+
+
+```{r}
+testpredrf = predict(final_rf_fit, test)
+head(testpredrf)
+confusionMatrix(testpredrf$.pred_class, test$failure, positive = "Yes")
+```
+
+
+
+## Neural Network  
+
+```{r}
+fail_nn_recipe = recipe(failure ~., train) %>%
+  step_normalize(all_predictors(), -all_nominal()) %>%
+  step_dummy(all_nominal(), -all_outcomes())
+
+fail_nn_model = mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("nnet", verbose = 0)
+
+fail_nn_workflow <- workflow() %>%
+  add_recipe(fail_nn_recipe) %>%
+  add_model(fail_nn_model)
+
+set.seed(1111)
+neural_tune <- tune_grid(fail_nn_workflow, resamples = folds, grid = 25)
+```
+
+```{r}
+neural_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  select(mean, hidden_units, penalty, epochs) %>%
+  pivot_longer(hidden_units:epochs,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Accuracy")
+```
+
+```{r}
+best_nn = select_best(neural_tune, metric = "accuracy")
+
+final_nn = finalize_workflow(
+  fail_nn_workflow,
+  best_nn)
+
+final_nn
+```
+```{r}
+neural_grid = grid_regular(
+  hidden_units(range = c(1,3)),
+  penalty(range = c(-9,-2)), 
+  epochs(range = c(300,400)),
+  levels = 10
+)
+  
+fail_nn_recipe = recipe(failure ~., train) %>%
+  step_normalize(all_predictors(), -all_nominal()) %>%
+  step_dummy(all_nominal(), -all_outcomes())
+
+fail_nn_model = 
+  mlp(hidden_units = tune(), penalty = tune(), 
+      epochs = tune()) %>%
+  set_mode("classification") %>% 
+  set_engine("nnet", verbose = 0)
+  
+fail_nn_workflow <- 
+  workflow() %>% 
+  add_recipe(fail_nn_recipe) %>% 
+  add_model(fail_nn_model) 
+
+set.seed(2222)
+neural_tune <-
+  tune_grid(fail_nn_workflow, resamples = folds, grid = neural_grid)
+```
+
+```{r}
+neural_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  select(mean, hidden_units, penalty, epochs) %>%
+  pivot_longer(hidden_units:epochs,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Accuracy")
+```
+
+```{r}
+best_nn = select_best(neural_tune, metric = "accuracy")
+
+final_nn = finalize_workflow(
+  fail_nn_workflow,
+  best_nn)
+
+final_nn
+```
+
+```{r}
+final_nn_fit = fit(final_nn, train)
+```
+
+```{r}
+trainprednn = predict(final_nn_fit, train)
+head(trainprednn)
+```
+
+```{r}
+confusionMatrix(trainprednn$.pred_class, train$failure, 
+                positive = "Yes")
+```
+
+```{r}
+testprednn = predict(final_nn_fit, test)
+head(testprednn)
+```
+
+```{r}
+confusionMatrix(testprednn$.pred_class, test$failure, 
+                positive = "Yes")
+```
+
